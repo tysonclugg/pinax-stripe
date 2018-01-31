@@ -4,7 +4,6 @@ import json
 from django.contrib.auth import get_user_model
 from django.dispatch import Signal
 from django.test import TestCase
-from django.test.client import Client
 
 import six
 import stripe
@@ -116,7 +115,7 @@ class WebhookTests(TestCase):
         StripeEventMock.return_value.to_dict.return_value = self.event_data
         TransferMock.return_value = self.event_data["data"]["object"]
         msg = json.dumps(self.event_data)
-        resp = Client().post(
+        resp = self.client.post(
             reverse("pinax_stripe_webhook"),
             six.u(msg),
             content_type="application/json"
@@ -133,7 +132,7 @@ class WebhookTests(TestCase):
         StripeEventMock.return_value.to_dict.return_value = connect_event_data
         TransferMock.return_value = connect_event_data["data"]["object"]
         msg = json.dumps(connect_event_data)
-        resp = Client().post(
+        resp = self.client.post(
             reverse("pinax_stripe_webhook"),
             six.u(msg),
             content_type="application/json"
@@ -152,7 +151,7 @@ class WebhookTests(TestCase):
         data = {"id": 123}
         Event.objects.create(stripe_id=123, livemode=True)
         msg = json.dumps(data)
-        resp = Client().post(
+        resp = self.client.post(
             reverse("pinax_stripe_webhook"),
             six.u(msg),
             content_type="application/json"
