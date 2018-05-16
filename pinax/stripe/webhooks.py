@@ -83,10 +83,12 @@ class Webhook(with_metaclass(Registerable, object)):
         """
         Validate incoming events.
 
-        We fetch the event data to ensure it is legit.
-        For Connect accounts we must fetch the event using the `stripe_account`
-        parameter.
+        If the event hasn't been validated upon arrival, we fetch the event
+        data to ensure it is legit.  For Connect accounts we must fetch the
+        event using the `stripe_account` parameter.
         """
+        if self.event.valid:
+            return  # event validated using Stripe-Signature header verification
         self.stripe_account = models.Account.objects.filter(
             stripe_id=self.event.webhook_message.get("account")).first()
         self.event.stripe_account = self.stripe_account
@@ -135,7 +137,7 @@ class Webhook(with_metaclass(Registerable, object)):
             if isinstance(e, stripe.StripeError):
                 data = e.http_body
             exceptions.log_exception(data=data, exception=e, event=self.event)
-            raise e
+            raise
 
     def process_webhook(self):
         return

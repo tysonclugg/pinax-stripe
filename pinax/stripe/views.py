@@ -1,5 +1,7 @@
 import json
+import logging
 
+from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.utils.decorators import method_decorator
@@ -21,6 +23,18 @@ from .conf import settings
 from .forms import PaymentMethodForm, PlanForm
 from .mixins import CustomerMixin, LoginRequiredMixin, PaymentsContextMixin
 from .models import Card, Event, Invoice, Subscription
+
+logger = logging.getLogger(__name__)
+
+
+class VerificationError(stripe.error.SignatureVerificationError, SuspiciousOperation):
+    """
+    Stripe-Signature header validation failed.
+
+    Inherits from SuspiciousOperation so that Django core middleware will return HttpResponseBadRequest (400), and from
+    VerificationError since that's what we're wrapping.
+    """
+    pass
 
 
 class InvoiceListView(LoginRequiredMixin, CustomerMixin, ListView):
@@ -191,13 +205,77 @@ class SubscriptionUpdateView(LoginRequiredMixin, CustomerMixin, FormMixin, Detai
 
 class Webhook(View):
 
+    secret = None
+
     @method_decorator(csrf_exempt)
-    def dispatch(self, *args, **kwargs):
-        return super(Webhook, self).dispatch(*args, **kwargs)
+    def dispatch(self, request, *args, **kwargs):
+        return super(Webhook, self).dispatch(request, *args, **kwargs)
+
+    def get_webhook_secret(self, request, data, *args, **kwargs):
+        """
+        Return the webhook secret for the given `request` and parsed `data`.
+
+        You may override this method to return different secrets based upon
+        request data such as `data["livemode"] == True` or similar.  The view
+        `args` and `kwargs` are also passed in for inspection.
+
+        You would want to override this if you wish to support rollover of the
+        webhook secret without deploying new code, where you have chosen to
+        store the secret in a database for example.
+        """
+        # secret provided via view kwargs or via settings
+        return self.secret
 
     def post(self, request, *args, **kwargs):
+        """
+        Stripe webhook receiver.
+
+        Raises VerificationError (a subclass of SuspiciousOperation) if there
+        is a problem validating the Stripe-Signature header, and Stripe
+        recieves a 400 (BAD REQUEST) status code.  We don't bother saving
+        invalid webhook events, since we don't want to DoS either our database
+        or the Stripe API if an attacker posts bogus webhook events.
+
+        If Stripe doesn't get a response with status code of 2xx after a
+        number of attempts, they will start sending alert emails to the Stripe
+        account admins until the issue is resolved. Stripe will continue
+        retrying webhook delivery for 3 days in live mode.
+
+        Admins should be reviewing emails from Stripe and logs from Django
+        daily as per section 10.6.1 of the Payment Card Industry (PCI) Data
+        Security Standard (v3.2).  This means admins will have a day or two to
+        resolve failed webhooks after they are notified via both emails from
+        Stripe, and via errors logged from raising VerificationError.
+        """
         body = smart_str(self.request.body)
         data = json.loads(body)
+        valid = False
+
+        if not settings.PINAX_STRIPE_WEBHOOK_VERIFY_SIGNATURES:
+            # force fallback to verification via API calls
+            logger.warn("PINAX_STRIPE_WEBHOOK_VERIFY_SIGNATURES disabled")
+        else:
+            try:
+                sig_header = request.META["HTTP_STRIPE_SIGNATURE"]
+            except KeyError:
+                raise VerificationError("Missing Stripe-Signature header", sig_header=None)
+
+            secret = self.get_webhook_secret(request, data, *args, **kwargs) or settings.PINAX_STRIPE_WEBHOOK_SECRET
+            if not secret:
+                raise ImproperlyConfigured("PINAX_STRIPE_WEBHOOK_SECRET not set")
+
+            try:
+                if not stripe.WebhookSignature.verify_header(
+                    payload=request.body.decode("utf-8"),
+                    header=sig_header,
+                    secret=secret,
+                    tolerance=settings.PINAX_STRIPE_WEBHOOK_TIMESTAMP_TOLERANCE,
+                ):
+                    raise VerificationError("Unverified webhook signature", sig_header=sig_header)
+                valid = True
+            except stripe.error.SignatureVerificationError as e:
+                raise VerificationError("SignatureVerificationError: {}".format(e), sig_header=sig_header)
+
         event = Event.objects.filter(stripe_id=data["id"]).first()
         if event:
             exceptions.log_exception(body, "Duplicate event record", event=event)
@@ -207,6 +285,7 @@ class Webhook(View):
                 kind=data["type"],
                 livemode=data["livemode"],
                 api_version=data["api_version"],
-                message=data
+                message=data,
+                valid=valid,
             )
-        return HttpResponse()
+        return HttpResponse(status=200)

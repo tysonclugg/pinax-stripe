@@ -3,7 +3,7 @@ from ..webhooks import registry
 
 
 def add_event(stripe_id, kind, livemode, message, api_version="",
-              request_id="", pending_webhooks=0):
+              request_id="", pending_webhooks=0, valid=False):
     """
     Adds and processes an event from a received webhook
 
@@ -29,9 +29,11 @@ def add_event(stripe_id, kind, livemode, message, api_version="",
         kind=kind,
         livemode=livemode,
         webhook_message=message,
+        validated_message=message if valid else None,
         api_version=api_version,
         request=request_id,
-        pending_webhooks=pending_webhooks
+        pending_webhooks=pending_webhooks,
+        valid=valid,
     )
     WebhookClass = registry.get(kind)
     if WebhookClass is not None:

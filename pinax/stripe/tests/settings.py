@@ -36,6 +36,8 @@ PINAX_STRIPE_SECRET_KEY = "sk_test_01234567890123456789abcd"
 PINAX_STRIPE_SUBSCRIPTION_REQUIRED_EXCEPTION_URLS = ["pinax_stripe_subscription_create"]
 PINAX_STRIPE_SUBSCRIPTION_REQUIRED_REDIRECT = "pinax_stripe_subscription_create"
 PINAX_STRIPE_HOOKSET = "pinax.stripe.tests.hooks.TestHookSet"
+PINAX_STRIPE_WEBHOOK_VERIFY_SIGNATURES = False  # override this on signature check tests
+PINAX_STRIPE_WEBHOOK_SECRET = "b85ca39a36a3e38533094ff729436551"
 TEMPLATES = [{
     "BACKEND": "django.template.backends.django.DjangoTemplates",
     "DIRS": [

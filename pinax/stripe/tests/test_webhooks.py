@@ -1,10 +1,14 @@
 import decimal
 import json
+import time
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
 from django.dispatch import Signal
-from django.test import TestCase
+from django.test import RequestFactory, TestCase, override_settings
 
+import mock
 import six
 import stripe
 from mock import patch
@@ -22,6 +26,8 @@ from ..models import (
     Plan,
     Transfer
 )
+from ..views import VerificationError
+from ..views import Webhook as WebhookView
 from ..webhooks import (
     AccountApplicationDeauthorizeWebhook,
     AccountExternalAccountCreatedWebhook,
@@ -213,6 +219,271 @@ class WebhookTests(TestCase):
         # note: we choose an event type for which we do no processing
         event = Event.objects.create(kind="account.external_account.created", webhook_message={}, valid=True, processed=False)
         self.assertIsNone(AccountExternalAccountCreatedWebhook(event).process())
+
+
+@override_settings(
+    PINAX_STRIPE_WEBHOOK_VERIFY_SIGNATURES=True,
+)
+class WebhookVerificationTest(TestCase):
+
+    event_data = {
+        "api_version": "2017-06-05",
+        "created": 1506381458,
+        "data": {
+            "object": {
+                "id": "silver-express-898",
+                "object": "plan",
+                "amount": 999,
+                "created": 1506381458,
+                "currency": "usd",
+                "interval": "month",
+                "interval_count": 1,
+                "livemode": False,
+                "metadata": {},
+                "name": "Silver Express",
+                "statement_descriptor": None,
+                "trial_period_days": None,
+            },
+        },
+        "id": "evt_XXXXXXXXXXXXx",
+        "livemode": True,
+        "object": "event",
+        "pending_webhooks": 1,
+        "type": "plan.created"
+    }
+    stripe_data = {
+        "/v1/events/evt_XXXXXXXXXXXXx": event_data,
+    }
+
+    def setUp(self):
+        self.request_factory = RequestFactory()
+        # mock the Stripe API for retrieving Event and Plan data
+        self.stripe_object_request_mock = patch(
+            "stripe.StripeObject.request",
+            new=mock.MagicMock(
+                side_effect=self.stripe_get,
+            ),
+        ).start()
+        self.view_logger_warn_mock = patch("pinax.stripe.views.logger.warn").start()
+        # unpatch all mocks when tests complete
+        self.addCleanup(patch.stopall)
+
+    def stripe_get(self, method, path):
+        self.assertEqual(method, "get")
+        return self.stripe_data[path]
+
+    def post_webhook(self, *args, **kwargs):
+        request = self.request_factory.post(*args, **kwargs)
+        view = WebhookView.as_view()
+        return view(request)
+
+    @staticmethod
+    def signature_headers(payload, secret=None, timestamp=None):
+        if secret is None:
+            secret = settings.PINAX_STRIPE_WEBHOOK_SECRET or "unobtainium"
+
+        if timestamp is None:
+            timestamp = int(time.time())  # seconds since epoch
+
+        # sign payload with timestamp and then compute signature
+        signed_payload = "{}.{}".format(timestamp, payload)
+        signature = stripe.WebhookSignature._compute_signature(signed_payload, secret)
+
+        # headers are CGI style: Stripe-Signature becomes HTTP_STRIPE_SIGNATURE
+        return {
+            "HTTP_STRIPE_SIGNATURE": "t={},v0=invalid,v1={}".format(int(timestamp), signature),
+        }
+
+    def test_webhook_secret_passed_via_as_view(self):
+        # create view instance with secret
+        view = WebhookView.as_view(secret="apples")
+
+        # call webhook with a request
+        msg = json.dumps(self.event_data)
+        request = self.request_factory.post(
+            reverse("pinax_stripe_webhook"),
+            six.u(msg),
+            content_type="application/json",
+            **self.signature_headers(msg, secret="apples")
+        )
+        resp = view(request)
+
+        # confirm the event was accepted and processed
+        self.assertEqual(resp.status_code, 200)
+        self.stripe_object_request_mock.assert_not_called()  # no need to check with the Stripe API
+        self.view_logger_warn_mock.assert_not_called()
+        self.assertQuerysetEqual(EventProcessingException.objects.all(), [])
+        self.assertQuerysetEqual(
+            Event.objects.values_list("kind", "stripe_id", "valid", "processed"),
+            [("plan.created", "evt_XXXXXXXXXXXXx", True, True)],
+            transform=tuple,
+        )
+
+    def test_webhook_secret_via_get_webhook_secret(self):
+        # subclass WebhookView custom get_webhook_secret implementation
+        class CustomWebhookView(WebhookView):
+            def get_webhook_secret(self, request, data, *args, **kwargs):
+                if data["livemode"]:
+                    return "whsec_apples"
+                else:
+                    return "whsec_bananas"
+
+        view = CustomWebhookView.as_view()
+
+        msg = json.dumps(self.event_data)
+        request = self.request_factory.post(
+            reverse("pinax_stripe_webhook"),
+            six.u(msg),
+            content_type="application/json",
+            **self.signature_headers(msg, secret="whsec_apples")
+        )
+        resp = view(request)
+
+        # confirm the event was accepted and processed
+        self.assertEqual(resp.status_code, 200)
+        self.stripe_object_request_mock.assert_not_called()  # no need to check with the Stripe API
+        self.view_logger_warn_mock.assert_not_called()
+        self.assertQuerysetEqual(EventProcessingException.objects.all(), [])
+        self.assertQuerysetEqual(
+            Event.objects.values_list("kind", "stripe_id", "valid", "processed"),
+            [("plan.created", "evt_XXXXXXXXXXXXx", True, True)],
+            transform=tuple,
+        )
+
+    def test_correct_webhook_secret_returns_200(self):
+        msg = json.dumps(self.event_data)
+        resp = self.post_webhook(
+            reverse("pinax_stripe_webhook"),
+            six.u(msg),
+            content_type="application/json",
+            **self.signature_headers(msg)
+        )
+
+        # confirm the event was accepted and processed
+        self.assertEqual(resp.status_code, 200)
+        self.stripe_object_request_mock.assert_not_called()  # no need to check with the Stripe API
+        self.view_logger_warn_mock.assert_not_called()
+        self.assertQuerysetEqual(EventProcessingException.objects.all(), [])
+        self.assertQuerysetEqual(
+            Event.objects.values_list("kind", "stripe_id", "valid", "processed"),
+            [("plan.created", "evt_XXXXXXXXXXXXx", True, True)],
+            transform=tuple,
+        )
+
+    @override_settings(
+        PINAX_STRIPE_WEBHOOK_VERIFY_SIGNATURES=False,
+    )
+    def test_verify_disabled_returns_200(self):
+        msg = json.dumps(self.event_data)
+        resp = self.client.post(
+            reverse("pinax_stripe_webhook"),
+            six.u(msg),
+            content_type="application/json",
+            **self.signature_headers(msg)
+        )
+
+        # confirm the event was accepted and processed
+        self.assertEqual(resp.status_code, 200)
+        self.stripe_object_request_mock.assert_called_once_with("get", "/v1/events/evt_XXXXXXXXXXXXx")
+        self.view_logger_warn_mock.assert_called_once_with("PINAX_STRIPE_WEBHOOK_VERIFY_SIGNATURES disabled")
+        self.assertQuerysetEqual(EventProcessingException.objects.all(), [])
+        self.assertQuerysetEqual(
+            Event.objects.values_list("kind", "stripe_id", "valid", "processed"),
+            [("plan.created", "evt_XXXXXXXXXXXXx", True, True)],
+            transform=tuple,
+        )
+
+    @override_settings(
+        PINAX_STRIPE_WEBHOOK_SECRET=None,
+    )
+    def test_no_webhook_secret_raises_improperly_configured(self):
+        msg = json.dumps(self.event_data)
+        with self.assertNumQueries(0):  # don't DoS the database
+            self.assertRaisesMessage(
+                ImproperlyConfigured,
+                "PINAX_STRIPE_WEBHOOK_SECRET not set",
+                self.post_webhook,
+                reverse("pinax_stripe_webhook"),
+                six.u(msg),
+                content_type="application/json",
+                **self.signature_headers(msg)
+            )
+        self.stripe_object_request_mock.assert_not_called()  # don't DoS the Stripe API
+
+    def test_post_without_signature_raises_invalid_signature(self):
+        msg = json.dumps(self.event_data)
+        with self.assertNumQueries(0):  # don't DoS the database
+            self.assertRaisesMessage(
+                VerificationError,
+                "Missing Stripe-Signature header",
+                self.post_webhook,
+                reverse("pinax_stripe_webhook"),
+                six.u(msg),
+                content_type="application/json",
+            )
+        self.stripe_object_request_mock.assert_not_called()  # don't DoS the Stripe API
+
+    def test_post_with_bad_signature_raises_invalid_signature(self):
+        msg = json.dumps(self.event_data)
+        with self.assertNumQueries(0):  # don't DoS the database
+            self.assertRaisesRegexp(
+                VerificationError,
+                "^SignatureVerificationError: ",
+                self.post_webhook,
+                reverse("pinax_stripe_webhook"),
+                six.u(msg),
+                content_type="application/json",
+                **self.signature_headers(msg, secret="invalid")
+            )
+        self.stripe_object_request_mock.assert_not_called()  # don't DoS the Stripe API
+
+    @patch("stripe.WebhookSignature.verify_header", return_value=False)
+    def test_stripe_verify_header_returning_false_raises_invalid_signature(self, verify_header_mock):
+        # The `stripe.WebhookSignature.verify_header` method returns `True`, or
+        # raises an exception.  We don't want to silently accept bad signatures
+        # if a future stripe update returns `False` instead of raising
+        # exceptions.
+        msg = json.dumps(self.event_data)
+        with self.assertNumQueries(0):  # don't DoS the database
+            self.assertRaisesMessage(
+                VerificationError,
+                "SignatureVerificationError: Unverified webhook signature",
+                self.post_webhook,
+                reverse("pinax_stripe_webhook"),
+                six.u(msg),
+                content_type="application/json",
+                **self.signature_headers(msg, secret="invalid")
+            )
+        verify_header_mock.assert_called_once()
+        self.stripe_object_request_mock.assert_not_called()  # don't DoS the Stripe API
+
+    def test_post_with_stale_timestamp_raises_invalid_signature(self):
+        msg = json.dumps(self.event_data)
+        with self.assertNumQueries(0):  # don't DoS the database
+            self.assertRaisesRegexp(
+                VerificationError,
+                "^SignatureVerificationError: ",
+                self.post_webhook,
+                reverse("pinax_stripe_webhook"),
+                six.u(msg),
+                content_type="application/json",
+                **self.signature_headers(msg, timestamp=1)
+            )
+        self.stripe_object_request_mock.assert_not_called()  # don't DoS the Stripe API
+
+    def test_post_without_signature_returns_400_bad_request(self):
+        msg = json.dumps(self.event_data)
+        with self.assertNumQueries(0):  # don't DoS the database
+            self.assertRaisesRegexp(
+                VerificationError,
+                "^SignatureVerificationError: ",
+                self.post_webhook,
+                reverse("pinax_stripe_webhook"),
+                six.u(msg),
+                content_type="application/json",
+                **self.signature_headers(msg, secret="invalid")
+            )
+        self.stripe_object_request_mock.assert_not_called()  # don't DoS the Stripe API
 
 
 class ChargeWebhookTest(TestCase):

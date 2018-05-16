@@ -38,6 +38,9 @@ class PinaxStripeAppConf(AppConf):
     SUBSCRIPTION_REQUIRED_REDIRECT = None
     SUBSCRIPTION_TAX_PERCENT = None
     DOCUMENT_MAX_SIZE_KB = 20 * 1024 * 1024
+    WEBHOOK_SECRET = None
+    WEBHOOK_VERIFY_SIGNATURES = True
+    WEBHOOK_TIMESTAMP_TOLERANCE = 5 * 60  # five minutes in seconds
 
     class Meta:
         prefix = "pinax_stripe"
